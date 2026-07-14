@@ -1,7 +1,7 @@
 [package]
 name = "chrysalis"
 version = "0.1.0"
-edition = "2021"
-description = "Parsers for Perl's Storable and Sereal serialization formats"
+edition = "2024"
+description = "Parsing library for Perl's Storable and Sereal serialization formats."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/<you>/chrysalis"
+repository = "https://github.com/deeksha-chitale/chrysalis"
