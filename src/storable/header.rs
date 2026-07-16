@@ -29,13 +29,19 @@ pub enum ByteOrder {
 }
 
 /*
-"1234"     → little endian, 32-bit
-"4321"     → big endian, 32-bit
-"12345678" → little endian, 64-bit
-"87654321" → big endian, 64-bit
+"1234"     → Little endian, 32-bit
+"4321"     → Big endian, 32-bit
+"12345678" → Little endian, 64-bit
+"87654321" → Big endian, 64-bit
 */
 
 pub fn parse(input: &[u8]) -> Result<VersionByte, HeaderError> {
+
+    // freeze() and nfreeze() write raw streams. store() and nstore() write streams with a "pst0" prefix (called 'magic').
+    let input = match input.strip_prefix(b"pst0") {
+    Some(rest) => rest,
+    None => input,
+    };
     
     if input.len() < 2 {
     return Err(HeaderError::Truncated);
@@ -94,6 +100,13 @@ pub fn parse(input: &[u8]) -> Result<VersionByte, HeaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_magic_is_stripped() {
+        let without_magic = &[0x05, 0x0B];
+        let with_magic = &[b'p', b's', b't', b'0', 0x05, 0x0B];
+        assert_eq!(parse(without_magic), parse(with_magic));
+    }
 
     #[test]
     fn freeze_sets_native_order() {
