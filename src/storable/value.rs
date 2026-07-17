@@ -109,3 +109,29 @@ mod tests {
         assert!(Rc::ptr_eq(&table.get(i).unwrap(), &table.get(j).unwrap()));
     }
 }
+
+pub struct ClassTable {
+    names: Vec<String>,
+}
+
+impl ClassTable {
+    pub fn new() -> Self {
+        Self { names: Vec::new() }
+    }
+
+    pub fn register(&mut self, name: String) -> usize {
+        let index = self.names.len();
+        self.names.push(name);
+        index
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        self.names.get(index).map(|s| s.as_str())
+    }
+}
+
+impl Default for ClassTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

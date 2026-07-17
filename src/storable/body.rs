@@ -1,5 +1,4 @@
-use crate::storable::value::{PerlValue, SeenTable, ValueRef};
-
+use crate::storable::value::{ClassTable, PerlValue, SeenTable, ValueRef};
 pub struct Cursor<'a> {
     input: &'a [u8],
     pos: usize,
@@ -40,11 +39,13 @@ pub enum BodyError {
     UnknownTag(u8),
     InvalidUtf8,
     ObjectIndexOutOfRange(usize),
+    ClassIndexOutOfRange(usize),   // NEW
 }
 
 pub fn read_value(
     cursor: &mut Cursor<'_>,
     seen: &mut SeenTable,
+    classes: &mut ClassTable,
 ) -> Result<ValueRef, BodyError> {
     let b = cursor.read_byte()?;
     match b {
@@ -111,7 +112,7 @@ pub fn read_value(
             let count = cursor.read_i32_ne()? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_value(cursor, seen)?);
+                items.push(read_value(cursor, seen, classes)?);
             }
 
             // Now replace the empty array with the populated one
@@ -129,7 +130,7 @@ pub fn read_value(
             let mut pairs = std::collections::HashMap::with_capacity(count);
             for _ in 0..count {
                 // Value first, then key
-                let value = read_value(cursor, seen)?;
+                let value = read_value(cursor, seen, classes)?;
                 let key_len = cursor.read_i32_ne()? as usize;
                 let key = cursor.read_bytes(key_len)?.to_vec();
                 pairs.insert(key, value);
@@ -146,7 +147,7 @@ pub fn read_value(
             let val = PerlValue::wrap(PerlValue::Ref(PerlValue::wrap(PerlValue::Undef)));
             seen.register(val.clone());
 
-            let inner = read_value(cursor, seen)?;
+            let inner = read_value(cursor, seen, classes)?;
 
             if let PerlValue::Ref(r) = &mut *val.borrow_mut() {
                 *r = inner;
@@ -161,6 +162,61 @@ pub fn read_value(
                 Some(val) => Ok(val),  // returns a clone of the Rc — same underlying value
                 None => Err(BodyError::ObjectIndexOutOfRange(index)),
             }
+        }
+
+        0x1B => {
+            // SX_WEAKREF — like SX_REF but the inner pointer is weak
+            // We need to parse the inner first to get an Rc, then downgrade to Weak
+            let val = PerlValue::wrap(PerlValue::Ref(PerlValue::wrap(PerlValue::Undef)));
+            seen.register(val.clone());
+
+            let inner = read_value(cursor, seen, classes)?;
+            let weak = std::rc::Rc::downgrade(&inner);
+
+            *val.borrow_mut() = PerlValue::WeakRef(weak);
+            Ok(val)
+        }
+
+        0x11 => {
+            let name_len = cursor.read_byte()? as usize;
+            let name_bytes = cursor.read_bytes(name_len)?.to_vec();
+            let class = String::from_utf8(name_bytes)
+                .map_err(|_| BodyError::InvalidUtf8)?;
+            classes.register(class.clone());  // NEW
+
+            let val = PerlValue::wrap(PerlValue::Blessed(
+                PerlValue::wrap(PerlValue::Undef),
+                class.clone(),
+            ));
+            seen.register(val.clone());
+
+            let inner = read_value(cursor, seen, classes)?;  // NEW signature
+
+            if let PerlValue::Blessed(r, _) = &mut *val.borrow_mut() {
+                *r = inner;
+            }
+            Ok(val)
+        }
+
+        0x12 => {
+            // SX_IX_BLESS — class name given by index into class table
+            let idx = cursor.read_byte()? as usize;
+            let class = classes.get(idx)
+                .ok_or(BodyError::ClassIndexOutOfRange(idx))?
+                .to_string();
+
+            let val = PerlValue::wrap(PerlValue::Blessed(
+                PerlValue::wrap(PerlValue::Undef),
+                class,
+            ));
+            seen.register(val.clone());
+
+            let inner = read_value(cursor, seen, classes)?;
+
+            if let PerlValue::Blessed(r, _) = &mut *val.borrow_mut() {
+                *r = inner;
+            }
+            Ok(val)
         }
         _ => Err(BodyError::UnknownTag(b)),
     }
@@ -178,9 +234,10 @@ mod tests {
 
     #[test]
     fn unknown_tag_errors() {
-        let mut seen = SeenTable::new();
-        assert_eq!(
-            read_value(&mut cursor(&[0x99]), &mut seen).unwrap_err(),
+    let mut seen = SeenTable::new();
+    let mut classes: ClassTable = ClassTable::new();
+    assert_eq!(
+            read_value(&mut cursor(&[0x99]), &mut seen, &mut classes).unwrap_err(),
             BodyError::UnknownTag(0x99)
         );
     }
@@ -188,36 +245,41 @@ mod tests {
     #[test]
     fn undef_tag() {
         let mut seen = SeenTable::new();
-        let val = read_value(&mut cursor(&[0x05]), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&[0x05]), &mut seen, &mut classes).unwrap();
         assert!(matches!(*val.borrow(), PerlValue::Undef));
     }
 
     #[test]
     fn yes_tag() {
         let mut seen = SeenTable::new();
-        let val = read_value(&mut cursor(&[0x0F]), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&[0x0F]), &mut seen, &mut classes).unwrap();
         assert!(matches!(*val.borrow(), PerlValue::Yes));
     }
 
     #[test]
     fn no_tag() {
         let mut seen = SeenTable::new();
-        let val = read_value(&mut cursor(&[0x10]), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&[0x10]), &mut seen, &mut classes).unwrap();
         assert!(matches!(*val.borrow(), PerlValue::No));
     }
 
     #[test]
     fn immortals_are_not_indexed() {
         let mut seen = SeenTable::new();
-        read_value(&mut cursor(&[0x05]), &mut seen).unwrap();
-        read_value(&mut cursor(&[0x0F]), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        read_value(&mut cursor(&[0x05]), &mut seen, &mut classes).unwrap();
+        read_value(&mut cursor(&[0x0F]), &mut seen, &mut classes).unwrap();
         assert_eq!(seen.len(), 0);
     }
 
     #[test]
     fn byte_becomes_integer_and_is_indexed() {
         let mut seen = SeenTable::new();
-        let val = read_value(&mut cursor(&[0x08, 0xAA]), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&[0x08, 0xAA]), &mut seen, &mut classes).unwrap();
         assert!(matches!(*val.borrow(), PerlValue::Integer(42)));
         assert_eq!(seen.len(), 1);
     }
@@ -225,10 +287,11 @@ mod tests {
     #[test]
     fn scalar_bytes() {
         let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
         let mut input = vec![0x0A];
         input.extend_from_slice(&3i32.to_ne_bytes());
         input.extend_from_slice(b"abc");
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::Bytes(b) => assert_eq!(b, b"abc"),
             _ => panic!("expected Bytes"),
@@ -242,7 +305,8 @@ mod tests {
         let mut input = vec![0x17];
         input.extend_from_slice(&5i32.to_ne_bytes());
         input.extend_from_slice(b"hello");
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::String(s) => assert_eq!(s, "hello"),
             _ => panic!("expected String"),
@@ -255,24 +319,26 @@ mod tests {
         let mut input = vec![0x17];
         input.extend_from_slice(&2i32.to_ne_bytes());
         input.extend_from_slice(&[0xFF, 0xFE]);
+        let mut classes: ClassTable = ClassTable::new();
         assert_eq!(
-            read_value(&mut cursor(&input), &mut seen).unwrap_err(),
+            read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap_err(),
             BodyError::InvalidUtf8
         );
     }
 
     #[test]
-fn empty_array() {
-    let mut seen = SeenTable::new();
-    let mut input = vec![0x02];
-    input.extend_from_slice(&0i32.to_ne_bytes());
-    let val = read_value(&mut cursor(&input), &mut seen).unwrap();
-    match &*val.borrow() {
-        PerlValue::Array(items) => assert!(items.is_empty()),
-        _ => panic!("expected Array"),
+    fn empty_array() {
+        let mut seen = SeenTable::new();
+        let mut input = vec![0x02];
+        input.extend_from_slice(&0i32.to_ne_bytes());
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+        match &*val.borrow() {
+            PerlValue::Array(items) => assert!(items.is_empty()),
+            _ => panic!("expected Array"),
+        }
+        assert_eq!(seen.len(), 1); // the array itself is indexed
     }
-    assert_eq!(seen.len(), 1); // the array itself is indexed
-}
 
     #[test]
     fn array_of_bytes() {
@@ -281,7 +347,8 @@ fn empty_array() {
         input.extend_from_slice(&2i32.to_ne_bytes());
         input.extend_from_slice(&[0x08, 0xAA]);  // 42
         input.extend_from_slice(&[0x08, 0x85]);  // 5
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::Array(items) => {
                 assert_eq!(items.len(), 2);
@@ -302,7 +369,8 @@ fn empty_array() {
         input.extend_from_slice(&[0x08, 0xAA]);  // value: 42
         input.extend_from_slice(&6i32.to_ne_bytes());
         input.extend_from_slice(b"answer");       // key
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::Hash(map) => {
                 assert_eq!(map.len(), 1);
@@ -316,8 +384,9 @@ fn empty_array() {
     #[test]
     fn ref_to_integer() {
         let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
         let input = vec![0x04, 0x08, 0xAA]; // SX_REF -> SX_BYTE 42
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::Ref(inner) => {
                 assert!(matches!(*inner.borrow(), PerlValue::Integer(42)));
@@ -331,6 +400,7 @@ fn empty_array() {
     #[test]
     fn back_reference() {
         let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
         // An array with one element, followed by a back-ref to that element
         // But easier: an array [42, ref-to-42] using SX_OBJECT
         // Actually, easiest: [42, SX_OBJECT index=1] — index 0 is the array, index 1 is the byte 42
@@ -340,7 +410,7 @@ fn empty_array() {
         input.push(0x00);                                // element 1: SX_OBJECT
         input.extend_from_slice(&1i32.to_ne_bytes());   // pointing at index 1
 
-        let val = read_value(&mut cursor(&input), &mut seen).unwrap();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
         match &*val.borrow() {
             PerlValue::Array(items) => {
                 assert_eq!(items.len(), 2);
@@ -357,9 +427,93 @@ fn empty_array() {
         let mut seen = SeenTable::new();
         let mut input = vec![0x00];
         input.extend_from_slice(&999i32.to_ne_bytes());
+        let mut classes: ClassTable = ClassTable::new();
         assert_eq!(
-            read_value(&mut cursor(&input), &mut seen).unwrap_err(),
+            read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap_err(),
             BodyError::ObjectIndexOutOfRange(999)
         );
+    }
+
+    #[test]
+    fn weakref_downgrade() {
+        let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
+        let input = vec![0x1B, 0x08, 0xAA]; // SX_WEAKREF -> SX_BYTE 42
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+        match &*val.borrow() {
+            PerlValue::WeakRef(w) => {
+                // Weak can be upgraded to Rc while the strong ref still exists in seen
+                let upgraded = w.upgrade().expect("still alive in seen table");
+                assert!(matches!(*upgraded.borrow(), PerlValue::Integer(42)));
+            }
+            _ => panic!("expected WeakRef"),
+        }
+    }
+
+    #[test]
+    fn cycle_does_not_leak() {
+        use std::rc::Rc;
+
+        // Construct: an array whose first element weakly refers back to the array itself
+        // Wire: SX_ARRAY count=1, SX_WEAKREF, SX_OBJECT index=0
+        // seen[0] = array, seen[1] = weakref wrapper
+        let mut input = vec![0x02];
+        input.extend_from_slice(&1i32.to_ne_bytes());
+        input.push(0x1B);                               // SX_WEAKREF
+        input.push(0x00);                               // SX_OBJECT
+        input.extend_from_slice(&0i32.to_ne_bytes());  // pointing at index 0 (the array)
+
+        let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+
+        // Verify the cycle exists
+        let strong_count_before = Rc::strong_count(&val);
+
+        // Drop the seen table — this is the moment of truth
+        drop(seen);
+
+        // If the cycle were made of strong Rcs, dropping seen would leave val's
+        // strong count > 1 (because the cycle keeps itself alive).
+        // Because we used WeakRef, dropping seen brings val's strong count back to 1.
+        assert_eq!(Rc::strong_count(&val), 1,
+            "cycle should not keep itself alive (was {} before drop, {} after)",
+            strong_count_before, Rc::strong_count(&val));
+    }
+
+    #[test]
+    fn blessed_hashref() {
+        let mut seen = SeenTable::new();
+        let mut classes: ClassTable = ClassTable::new();
+        // SX_BLESS "Animal" -> SX_REF -> SX_HASH count=1 -> SX_BYTE 3, key "age"
+        let mut input = vec![0x11];
+        input.push(6);                                    // class name length
+        input.extend_from_slice(b"Animal");               // class name
+        input.push(0x04);                                 // SX_REF
+        input.push(0x03);                                 // SX_HASH
+        input.extend_from_slice(&1i32.to_ne_bytes());    // 1 pair
+        input.extend_from_slice(&[0x08, 0x83]);          // SX_BYTE 3
+        input.extend_from_slice(&3i32.to_ne_bytes());    // key length
+        input.extend_from_slice(b"age");                  // key
+
+        let mut classes: ClassTable = ClassTable::new();
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+        match &*val.borrow() {
+            PerlValue::Blessed(inner, class) => {
+                assert_eq!(class, "Animal");
+                match &*inner.borrow() {
+                    PerlValue::Ref(hash_ref) => match &*hash_ref.borrow() {
+                        PerlValue::Hash(map) => {
+                            assert_eq!(map.len(), 1);
+                            let age = map.get(b"age".as_slice()).unwrap();
+                            assert!(matches!(*age.borrow(), PerlValue::Integer(3)));
+                        }
+                        _ => panic!("expected Hash inside Ref"),
+                    },
+                    _ => panic!("expected Ref"),
+                }
+            }
+            _ => panic!("expected Blessed"),
+        }
     }
 }
