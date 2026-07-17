@@ -218,6 +218,26 @@ pub fn read_value(
             }
             Ok(val)
         }
+
+        0x01 => {
+            // SX_LSCALAR — same as SX_SCALAR, used for strings > i32::MAX bytes
+            let len = cursor.read_i32_ne()? as usize;
+            let bytes = cursor.read_bytes(len)?.to_vec();
+            let val = PerlValue::wrap(PerlValue::Bytes(bytes));
+            seen.register(val.clone());
+            Ok(val)
+        }
+        0x18 => {
+            // SX_LUTF8STR — same as SX_UTF8STR, used for strings > i32::MAX bytes
+            let len = cursor.read_i32_ne()? as usize;
+            let bytes = cursor.read_bytes(len)?;
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| BodyError::InvalidUtf8)?
+                .to_string();
+            let val = PerlValue::wrap(PerlValue::String(s));
+            seen.register(val.clone());
+            Ok(val)
+        }
         _ => Err(BodyError::UnknownTag(b)),
     }
 
@@ -514,6 +534,34 @@ mod tests {
                 }
             }
             _ => panic!("expected Blessed"),
+        }
+    }
+
+    #[test]
+    fn lscalar_bytes() {
+        let mut seen = SeenTable::new();
+        let mut classes = ClassTable::new();
+        let mut input = vec![0x01];
+        input.extend_from_slice(&3i32.to_ne_bytes());
+        input.extend_from_slice(b"xyz");
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+        match &*val.borrow() {
+            PerlValue::Bytes(b) => assert_eq!(b, b"xyz"),
+            _ => panic!("expected Bytes"),
+        }
+    }
+
+    #[test]
+    fn lutf8str_string() {
+        let mut seen = SeenTable::new();
+        let mut classes = ClassTable::new();
+        let mut input = vec![0x18];
+        input.extend_from_slice(&5i32.to_ne_bytes());
+        input.extend_from_slice(b"world");
+        let val = read_value(&mut cursor(&input), &mut seen, &mut classes).unwrap();
+        match &*val.borrow() {
+            PerlValue::String(s) => assert_eq!(s, "world"),
+            _ => panic!("expected String"),
         }
     }
 }
