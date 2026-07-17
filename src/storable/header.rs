@@ -35,7 +35,7 @@ pub enum ByteOrder {
 "87654321" → Big endian, 64-bit
 */
 
-pub fn parse(input: &[u8]) -> Result<VersionByte, HeaderError> {
+pub fn parse(input: &[u8]) -> Result<(VersionByte, &[u8]), HeaderError> {
 
     // freeze() and nfreeze() write raw streams. store() and nstore() write streams with a "pst0" prefix (called 'magic').
     let input = match input.strip_prefix(b"pst0") {
@@ -57,7 +57,10 @@ pub fn parse(input: &[u8]) -> Result<VersionByte, HeaderError> {
     } 
 
     if network_order {
-        return Ok(VersionByte { major, minor, network_order, arch: None });
+        return Ok((
+            VersionByte { major, minor, network_order, arch: None },
+            &input[2..],
+        ));
     }
 
     // The following is for native order; we read the architecture block.
@@ -93,8 +96,10 @@ pub fn parse(input: &[u8]) -> Result<VersionByte, HeaderError> {
         nv_size: input[offset + 3],
     };
 
-    Ok(VersionByte { major, minor, network_order, arch: Some(arch) })
-
+    Ok((
+        VersionByte { major, minor, network_order, arch: Some(arch) },
+        &input[offset + 4..],
+    ))
 
 }
 #[cfg(test)]
@@ -112,18 +117,21 @@ mod tests {
     fn freeze_sets_native_order() {
         assert_eq!(
             parse(&[0x04, 0x0B, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', 0x04, 0x04, 0x08, 0x08]),
-            Ok(VersionByte {
-                major: 2,
-                minor: 11,
-                network_order: false,
-                arch: Some(ArchInfo {
-                    byteorder: ByteOrder::Little,
-                    int_size: 4,
-                    long_size: 4,
-                    ptr_size: 8,
-                    nv_size: 8,
-                }),
-            })
+            Ok((
+                VersionByte {
+                    major: 2,
+                    minor: 11,
+                    network_order: false,
+                    arch: Some(ArchInfo {
+                        byteorder: ByteOrder::Little,
+                        int_size: 4,
+                        long_size: 4,
+                        ptr_size: 8,
+                        nv_size: 8,
+                    }),
+                },
+                &[][..],
+            ))
         );
     }
 
@@ -131,12 +139,15 @@ mod tests {
     fn nfreeze_sets_network_order() {
         assert_eq!(
             parse(&[0x05, 0x0B]),
-            Ok(VersionByte {
-                major: 2,
-                minor: 11,
-                network_order: true,
-                arch: None,
-            })
+            Ok((
+                VersionByte {
+                    major: 2,
+                    minor: 11,
+                    network_order: true,
+                    arch: None,
+                },
+                &[][..],
+            ))
         );
     }
 
