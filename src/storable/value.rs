@@ -28,6 +28,33 @@ pub enum PerlValue {
 
     // A blessed value: inner data + class name
     Blessed(ValueRef, String),
+
+    Overloaded(ValueRef),
+    WeakOverloaded(Weak<RefCell<PerlValue>>),
+    VString(Vec<u8>),
+
+    FlagHash {
+        hash_flags: u8,
+        entries: HashMap<Vec<u8>, (u8, ValueRef)>,
+    },
+
+    TiedScalar(ValueRef),
+    TiedArray(ValueRef),
+    TiedHash(ValueRef),
+    TiedKey(ValueRef, ValueRef),        // (tied object, key)
+    TiedIdx(ValueRef, i64),             // (tied object, index)
+
+    Code(String),  // Perl source of a code ref
+
+    Regexp { pattern: ValueRef, flags: String },
+
+    Hook {
+        class: String,
+        obj_type: u8,           // 0=scalar, 1=array, 2=hash, 3=extra
+        frozen: Vec<u8>,
+        refs: Vec<ValueRef>,    // resolved from seen-table indices
+        recurse: Vec<ValueRef>, // values consumed by SHF_NEED_RECURSE (usually empty)
+    },
 }
 
 impl PerlValue {

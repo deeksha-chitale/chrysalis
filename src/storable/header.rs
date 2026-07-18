@@ -1,3 +1,5 @@
+use crate::storable::body::BodyConfig;
+
 #[derive(Debug, PartialEq)]
 pub enum HeaderError {
     UnsupportedMajor(u8),
@@ -13,9 +15,28 @@ pub struct VersionByte {
     pub arch: Option<ArchInfo>,
 }
 
+impl VersionByte {
+    pub fn body_config(&self) -> BodyConfig {
+        if let Some(arch) = &self.arch {
+            BodyConfig {
+                iv_size: arch.word_size,
+                nv_size: arch.nv_size,
+                network_order: false,
+            }
+        } else {
+            BodyConfig {
+                iv_size: 4,       // network order integers are 4 bytes big-endian
+                nv_size: 8,
+                network_order: true,
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ArchInfo {
     pub byteorder: ByteOrder,
+    pub word_size: u8,     // NEW: 4 or 8, derived from byteorder string length
     pub int_size: u8,
     pub long_size: u8,
     pub ptr_size: u8,
@@ -77,9 +98,11 @@ pub fn parse(input: &[u8]) -> Result<(VersionByte, &[u8]), HeaderError> {
 
     let byte_order_string = &input[3..3 + byte_order_length];
 
-    let byteorder = match byte_order_string {
-        b"1234" | b"12345678" => ByteOrder::Little,
-        b"4321" | b"87654321" => ByteOrder::Big,
+    let (byteorder, word_size) = match byte_order_string {
+        b"1234" => (ByteOrder::Little, 4),
+        b"4321" => (ByteOrder::Big, 4),
+        b"12345678" => (ByteOrder::Little, 8),
+        b"87654321" => (ByteOrder::Big, 8),
         _ => return Err(HeaderError::UnknownByteOrder),
     };
 
@@ -90,6 +113,7 @@ pub fn parse(input: &[u8]) -> Result<(VersionByte, &[u8]), HeaderError> {
 
     let arch = ArchInfo {
         byteorder,
+        word_size,
         int_size: input[offset],
         long_size: input[offset + 1],
         ptr_size: input[offset + 2],
@@ -124,6 +148,7 @@ mod tests {
                     network_order: false,
                     arch: Some(ArchInfo {
                         byteorder: ByteOrder::Little,
+                        word_size: 8,
                         int_size: 4,
                         long_size: 4,
                         ptr_size: 8,
