@@ -980,13 +980,14 @@ mod tests {
         let mut classes = ClassTable::new();
         let config = BodyConfig::native_64();
         let src = "sub { $_[0] + 1 }";
-        let mut input = vec![0x1A];
-        input.extend_from_slice(&(src.len() as i32).to_ne_bytes());
+        let mut input = vec![0x1A];       // SX_CODE
+        input.push(0x0A);                 // inner type: SX_SCALAR
+        input.push(src.len() as u8);      // SX_SCALAR uses 1-byte length
         input.extend_from_slice(src.as_bytes());
         let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
         match &*val.borrow() {
             PerlValue::Code(s) => assert_eq!(s, src),
-            _ => panic!("expected Code"),
+            other => panic!("code: {:?}", other),
         }
     }
 

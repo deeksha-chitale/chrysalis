@@ -1,6 +1,6 @@
 [package]
 name = "chrysalis"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Parsing library for Perl's Storable and Sereal serialization formats."
 license = "MIT OR Apache-2.0"
