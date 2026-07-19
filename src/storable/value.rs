@@ -55,6 +55,8 @@ pub enum PerlValue {
         refs: Vec<ValueRef>,    // resolved from seen-table indices
         recurse: Vec<ValueRef>, // values consumed by SHF_NEED_RECURSE (usually empty)
     },
+
+    UnsignedInteger(u64),
 }
 
 impl PerlValue {

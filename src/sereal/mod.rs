@@ -12,6 +12,10 @@ impl<'a> Cursor<'a> {
         Self { input, pos: 0 }
     }
 
+    pub fn remaining_len(&self) -> usize {
+        self.input.len() - self.pos
+    }
+
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -62,8 +66,10 @@ impl<'a> Cursor<'a> {
 }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum SerealError {
+    ClassOffsetNotFound(usize),
+    InvalidCopyOffset(usize),
     Truncated,
     VarintTooLong,
     BadMagic,
@@ -72,7 +78,11 @@ pub enum SerealError {
     UnknownTag(u8),
     MagicVersionMismatch,
     OffsetNotFound(usize),
-    InvalidUtf8 
+    InvalidUtf8,
+    MaxDepthExceeded,
+    CountExceedsInput { count: usize, remaining: usize },
+    UnexpectedValueType { expected: &'static str, context: &'static str },
+    UnexpectedPacketStart,
 }
 
 #[cfg(test)]

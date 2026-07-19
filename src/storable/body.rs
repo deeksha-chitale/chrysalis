@@ -302,7 +302,7 @@ pub fn read_value(
             let len = cursor.read_byte()? as usize;
             let vbytes = cursor.read_bytes(len)?.to_vec();
             // Read the following scalar (which gets registered in seen by its own handler)
-            let inner = read_value(cursor, seen, classes, config)?;
+            let _inner = read_value(cursor, seen, classes, config)?;
             // Return a VString wrapping the bytes; don't register vstring itself
             let val = PerlValue::wrap(PerlValue::VString(vbytes));
             Ok(val)
@@ -311,7 +311,7 @@ pub fn read_value(
             // SX_LVSTRING — same but length is i32 (4 bytes)
             let len = cursor.read_i32_ne()? as usize;
             let vbytes = cursor.read_bytes(len)?.to_vec();
-            let inner = read_value(cursor, seen, classes, config)?;
+            let _inner = read_value(cursor, seen, classes, config)?;
             let val = PerlValue::wrap(PerlValue::VString(vbytes));
             Ok(val)
         }
@@ -1039,4 +1039,5 @@ mod tests {
             _ => panic!("expected Hook"),
         }
     }
+
 }
