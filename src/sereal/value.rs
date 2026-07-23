@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::storable::value::{ValueRef}; 
+use crate::shared_model::ValueRef;
 
 pub struct SerealSeenTable {
     offsets: HashMap<usize, ValueRef>,

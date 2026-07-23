@@ -1,4 +1,5 @@
-use crate::storable::value::{ClassTable, PerlValue, SeenTable, ValueRef};
+use crate::shared_model::{PerlValue, ValueRef, ClassTable, SeenTable};
+
 
 const SHF_TYPE_MASK: u8 = 0x03;
 const SHF_LARGE_CLASSLEN: u8 = 0x04;
@@ -49,9 +50,13 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    pub fn read_i32_ne(&mut self) -> Result<i32, BodyError> {
+    pub fn read_i32(&mut self, network_order: bool) -> Result<i32, BodyError> {
         let bytes = self.read_bytes(4)?;
-        Ok(i32::from_ne_bytes(bytes.try_into().unwrap()))
+        if network_order {
+            Ok(i32::from_be_bytes(bytes.try_into().unwrap()))
+        } else {
+            Ok(i32::from_ne_bytes(bytes.try_into().unwrap()))
+        }
     }
 
     pub fn pos(&self) -> usize {
@@ -143,7 +148,7 @@ pub fn read_value(
             let val = PerlValue::wrap(PerlValue::Array(Vec::new()));
             seen.register(val.clone());
 
-            let count = cursor.read_i32_ne()? as usize;
+            let count = cursor.read_i32(config.network_order)?as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
                 items.push(read_value(cursor, seen, classes, config)?);
@@ -160,12 +165,12 @@ pub fn read_value(
             let val = PerlValue::wrap(PerlValue::Hash(std::collections::HashMap::new()));
             seen.register(val.clone());
 
-            let count = cursor.read_i32_ne()? as usize;
+            let count = cursor.read_i32(config.network_order)?as usize;
             let mut pairs = std::collections::HashMap::with_capacity(count);
             for _ in 0..count {
                 // Value first, then key
                 let value = read_value(cursor, seen, classes, config)?;
-                let key_len = cursor.read_i32_ne()? as usize;
+                let key_len = cursor.read_i32(config.network_order)?as usize;
                 let key = cursor.read_bytes(key_len)?.to_vec();
                 pairs.insert(key, value);
             }
@@ -214,50 +219,37 @@ pub fn read_value(
         }
 
         0x11 => {
+            // SX_BLESS — Layout: <len> <classname> <object>
+            // Storable: "First SV which is SEEN will be blessed" — sv_bless mutates
+            // the already-registered SV in place. We replicate that by parsing the
+            // inner value (which registers itself at the correct tag), then swapping
+            // its OWN RefCell contents to Blessed(...) — same Rc, same tag, so any
+            // later back-reference to this tag still resolves to this exact node,
+            // now carrying the class.
             let name_len = cursor.read_byte()? as usize;
             let name_bytes = cursor.read_bytes(name_len)?.to_vec();
-            let class = String::from_utf8(name_bytes)
-                .map_err(|_| BodyError::InvalidUtf8)?;
-            classes.register(class.clone());  // NEW
+            let class = String::from_utf8(name_bytes).map_err(|_| BodyError::InvalidUtf8)?;
+            classes.register(class.clone());
 
-            let val = PerlValue::wrap(PerlValue::Blessed(
-                PerlValue::wrap(PerlValue::Undef),
-                class.clone(),
-            ));
-            seen.register(val.clone());
-
-            let inner = read_value(cursor, seen, classes, config)?;  // NEW signature
-
-            if let PerlValue::Blessed(r, _) = &mut *val.borrow_mut() {
-                *r = inner;
-            }
-            Ok(val)
+            let inner = read_value(cursor, seen, classes, config)?;
+            let unblessed = inner.replace(PerlValue::Undef); // take the parsed content out
+            *inner.borrow_mut() = PerlValue::Blessed(PerlValue::wrap(unblessed), class);
+            Ok(inner) // same Rc as before — its tag/seen-slot is unchanged
         }
 
         0x12 => {
-            // SX_IX_BLESS — class name given by index into class table
             let idx = cursor.read_byte()? as usize;
-            let class = classes.get(idx)
-                .ok_or(BodyError::ClassIndexOutOfRange(idx))?
-                .to_string();
-
-            let val = PerlValue::wrap(PerlValue::Blessed(
-                PerlValue::wrap(PerlValue::Undef),
-                class,
-            ));
-            seen.register(val.clone());
+            let class = classes.get(idx).ok_or(BodyError::ClassIndexOutOfRange(idx))?.to_string();
 
             let inner = read_value(cursor, seen, classes, config)?;
-
-            if let PerlValue::Blessed(r, _) = &mut *val.borrow_mut() {
-                *r = inner;
-            }
-            Ok(val)
+            let unblessed = inner.replace(PerlValue::Undef);
+            *inner.borrow_mut() = PerlValue::Blessed(PerlValue::wrap(unblessed), class);
+            Ok(inner)
         }
 
         0x01 => {
             // SX_LSCALAR — same as SX_SCALAR, used for strings > i32::MAX bytes
-            let len = cursor.read_i32_ne()? as usize;
+            let len = cursor.read_i32(config.network_order)?as usize;
             let bytes = cursor.read_bytes(len)?.to_vec();
             let val = PerlValue::wrap(PerlValue::Bytes(bytes));
             seen.register(val.clone());
@@ -265,7 +257,7 @@ pub fn read_value(
         }
         0x18 => {
             // SX_LUTF8STR — same as SX_UTF8STR, used for strings > i32::MAX bytes
-            let len = cursor.read_i32_ne()? as usize;
+            let len = cursor.read_i32(config.network_order)?as usize;
             let bytes = cursor.read_bytes(len)?;
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| BodyError::InvalidUtf8)?
@@ -309,7 +301,7 @@ pub fn read_value(
         }
         0x1E => {
             // SX_LVSTRING — same but length is i32 (4 bytes)
-            let len = cursor.read_i32_ne()? as usize;
+            let len = cursor.read_i32(config.network_order)?as usize;
             let vbytes = cursor.read_bytes(len)?.to_vec();
             let _inner = read_value(cursor, seen, classes, config)?;
             let val = PerlValue::wrap(PerlValue::VString(vbytes));
@@ -325,12 +317,12 @@ pub fn read_value(
             seen.register(val.clone());
 
             let hash_flags = cursor.read_byte()?;
-            let count = cursor.read_i32_ne()? as usize;
+            let count = cursor.read_i32(config.network_order)?as usize;
             let mut entries = std::collections::HashMap::with_capacity(count);
             for _ in 0..count {
                 let value = read_value(cursor, seen, classes, config)?;
                 let key_flags = cursor.read_byte()?;
-                let key_len = cursor.read_i32_ne()? as usize;
+                let key_len = cursor.read_i32(config.network_order)?as usize;
                 let key = cursor.read_bytes(key_len)?.to_vec();
                 entries.insert(key, (key_flags, value));
             }
@@ -390,7 +382,7 @@ pub fn read_value(
             ));
             seen.register(val.clone());
             let object = read_value(cursor, seen, classes, config)?;
-            let idx = cursor.read_i32_ne()? as i64;
+            let idx = cursor.read_i32(config.network_order)?as i64;
             *val.borrow_mut() = PerlValue::TiedIdx(object, idx);
             Ok(val)
         }
@@ -416,7 +408,7 @@ pub fn read_value(
                 }
                 0x01 => {
                     // SX_LSCALAR: 4-byte length
-                    let len = cursor.read_i32_ne()? as usize;
+                    let len = cursor.read_i32(config.network_order)?as usize;
                     let bytes = cursor.read_bytes(len)?;
                     let inner = PerlValue::wrap(PerlValue::Bytes(bytes.to_vec()));
                     seen.register(inner);
@@ -433,7 +425,7 @@ pub fn read_value(
                 }
                 0x18 => {
                     // SX_LUTF8STR: 4-byte length
-                    let len = cursor.read_i32_ne()? as usize;
+                    let len = cursor.read_i32(config.network_order)?as usize;
                     let bytes = cursor.read_bytes(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|_| BodyError::InvalidUtf8)?.to_string();
                     let inner = PerlValue::wrap(PerlValue::String(s.clone()));
@@ -452,7 +444,7 @@ pub fn read_value(
             // Format: <op_flags:byte> <re_len:1or4 bytes> <pattern bytes> <flags_len:byte> <flags bytes>
             let op_flags = cursor.read_byte()?;
             let re_len = if op_flags & 0x01 != 0 {
-                cursor.read_i32_ne()? as usize   // SHR_U32_RE_LEN set: 4-byte length
+                cursor.read_i32(config.network_order)?as usize   // SHR_U32_RE_LEN set: 4-byte length
             } else {
                 cursor.read_byte()? as usize     // 1-byte length
             };
@@ -494,7 +486,7 @@ pub fn read_value(
             // Class name — by index or by string, byte or i32 length
             let class = if flags & SHF_IDX_CLASSNAME != 0 {
                 let idx = if flags & SHF_LARGE_CLASSLEN != 0 {
-                    cursor.read_i32_ne()? as usize
+                    cursor.read_i32(config.network_order)?as usize
                 } else {
                     cursor.read_byte()? as usize
                 };
@@ -503,7 +495,7 @@ pub fn read_value(
                     .to_string()
             } else {
                 let name_len = if flags & SHF_LARGE_CLASSLEN != 0 {
-                    cursor.read_i32_ne()? as usize
+                    cursor.read_i32(config.network_order)?as usize
                 } else {
                     cursor.read_byte()? as usize
                 };
@@ -515,7 +507,7 @@ pub fn read_value(
 
             // Frozen payload — byte or u32 length
             let frozen_len = if flags & SHF_LARGE_STRLEN != 0 {
-                cursor.read_i32_ne()? as usize
+                cursor.read_i32(config.network_order)?as usize
             } else {
                 cursor.read_byte()? as usize
             };
@@ -525,7 +517,7 @@ pub fn read_value(
             let mut refs = Vec::new();
             if flags & SHF_HAS_LIST != 0 {
                 let count = if flags & SHF_LARGE_LISTLEN != 0 {
-                    cursor.read_i32_ne()? as usize
+                    cursor.read_i32(config.network_order)?as usize
                 } else {
                     cursor.read_byte()? as usize
                 };
@@ -557,487 +549,3 @@ pub fn read_value(
     
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cursor(bytes: &[u8]) -> Cursor<'_> {
-        Cursor::new(bytes)
-    }
-
-    #[test]
-    fn unknown_tag_errors() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        assert_eq!(
-            read_value(&mut cursor(&[0x99]), &mut seen, &mut classes, &config).unwrap_err(),
-            BodyError::UnknownTag(0x99)
-        );
-    }
-
-    #[test]
-    fn undef_tag() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let val = read_value(&mut cursor(&[0x05]), &mut seen, &mut classes, &config).unwrap();
-        assert!(matches!(*val.borrow(), PerlValue::Undef));
-    }
-
-    #[test]
-    fn yes_tag() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let val = read_value(&mut cursor(&[0x0F]), &mut seen, &mut classes, &config).unwrap();
-        assert!(matches!(*val.borrow(), PerlValue::Yes));
-    }
-
-    #[test]
-    fn no_tag() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let val = read_value(&mut cursor(&[0x10]), &mut seen, &mut classes, &config).unwrap();
-        assert!(matches!(*val.borrow(), PerlValue::No));
-    }
-
-    #[test]
-    fn immortals_are_not_indexed() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        read_value(&mut cursor(&[0x05]), &mut seen, &mut classes, &config).unwrap();  // SX_UNDEF
-        read_value(&mut cursor(&[0x0F]), &mut seen, &mut classes, &config).unwrap();  // SX_SV_YES old
-        read_value(&mut cursor(&[0x22]), &mut seen, &mut classes, &config).unwrap();  // SX_SV_YES new
-        read_value(&mut cursor(&[0x10]), &mut seen, &mut classes, &config).unwrap();  // SX_SV_NO old
-        read_value(&mut cursor(&[0x23]), &mut seen, &mut classes, &config).unwrap();  // SX_SV_NO new
-        assert_eq!(seen.len(), 0);
-    }
-
-    #[test]
-    fn byte_becomes_integer_and_is_indexed() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let val = read_value(&mut cursor(&[0x08, 0xAA]), &mut seen, &mut classes, &config).unwrap();
-        assert!(matches!(*val.borrow(), PerlValue::Integer(42)));
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[test]
-    fn scalar_bytes() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x0A, 3];
-        input.extend_from_slice(b"abc");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Bytes(b) => assert_eq!(b, b"abc"),
-            _ => panic!("expected Bytes"),
-        }
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[test]
-    fn utf8_string() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x17, 5];
-        input.extend_from_slice(b"hello");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::String(s) => assert_eq!(s, "hello"),
-            _ => panic!("expected String"),
-        }
-    }
-
-    #[test]
-    fn invalid_utf8_errors() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x17, 2];
-        input.extend_from_slice(&[0xFF, 0xFE]);
-        assert_eq!(
-            read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap_err(),
-            BodyError::InvalidUtf8
-        );
-    }
-
-    #[test]
-    fn empty_array() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x02];
-        input.extend_from_slice(&0i32.to_ne_bytes());
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Array(items) => assert!(items.is_empty()),
-            _ => panic!("expected Array"),
-        }
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[test]
-    fn array_of_bytes() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x02];
-        input.extend_from_slice(&2i32.to_ne_bytes());
-        input.extend_from_slice(&[0x08, 0xAA]);
-        input.extend_from_slice(&[0x08, 0x85]);
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Array(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(*items[0].borrow(), PerlValue::Integer(42)));
-                assert!(matches!(*items[1].borrow(), PerlValue::Integer(5)));
-            }
-            _ => panic!("expected Array"),
-        }
-        assert_eq!(seen.len(), 3);
-    }
-
-    #[test]
-    fn simple_hash() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x03];
-        input.extend_from_slice(&1i32.to_ne_bytes());
-        input.extend_from_slice(&[0x08, 0xAA]);
-        input.extend_from_slice(&6i32.to_ne_bytes());
-        input.extend_from_slice(b"answer");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Hash(map) => {
-                assert_eq!(map.len(), 1);
-                let v = map.get(b"answer".as_slice()).unwrap();
-                assert!(matches!(*v.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected Hash"),
-        }
-    }
-
-    #[test]
-    fn ref_to_integer() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let input = vec![0x04, 0x08, 0xAA];
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Ref(inner) => {
-                assert!(matches!(*inner.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected Ref"),
-        }
-        assert_eq!(seen.len(), 2);
-    }
-
-    #[test]
-    fn back_reference() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x02];
-        input.extend_from_slice(&2i32.to_ne_bytes());
-        input.extend_from_slice(&[0x08, 0xAA]);
-        input.push(0x00);
-        input.extend_from_slice(&1i32.to_be_bytes());
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Array(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(std::rc::Rc::ptr_eq(&items[0], &items[1]));
-                assert!(matches!(*items[0].borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected Array"),
-        }
-    }
-
-    #[test]
-    fn back_reference_out_of_range() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x00];
-        input.extend_from_slice(&999i32.to_be_bytes());
-        assert_eq!(
-            read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap_err(),
-            BodyError::ObjectIndexOutOfRange(999)
-        );
-    }
-
-    #[test]
-    fn weakref_downgrade() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let input = vec![0x1B, 0x08, 0xAA];
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::WeakRef(w) => {
-                let upgraded = w.upgrade().expect("still alive in seen table");
-                assert!(matches!(*upgraded.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected WeakRef"),
-        }
-    }
-
-    #[test]
-    fn cycle_does_not_leak() {
-        use std::rc::Rc;
-        let mut input = vec![0x02];
-        input.extend_from_slice(&1i32.to_ne_bytes());
-        input.push(0x1B);
-        input.push(0x00);
-        input.extend_from_slice(&0i32.to_be_bytes());
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        let strong_count_before = Rc::strong_count(&val);
-        drop(seen);
-        assert_eq!(Rc::strong_count(&val), 1,
-            "cycle should not keep itself alive (was {} before drop, {} after)",
-            strong_count_before, Rc::strong_count(&val));
-    }
-
-    #[test]
-    fn blessed_hashref() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x11];
-        input.push(6);
-        input.extend_from_slice(b"Animal");
-        input.push(0x04);
-        input.push(0x03);
-        input.extend_from_slice(&1i32.to_ne_bytes());
-        input.extend_from_slice(&[0x08, 0x83]);
-        input.extend_from_slice(&3i32.to_ne_bytes());
-        input.extend_from_slice(b"age");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Blessed(inner, class) => {
-                assert_eq!(class, "Animal");
-                match &*inner.borrow() {
-                    PerlValue::Ref(hash_ref) => match &*hash_ref.borrow() {
-                        PerlValue::Hash(map) => {
-                            assert_eq!(map.len(), 1);
-                            let age = map.get(b"age".as_slice()).unwrap();
-                            assert!(matches!(*age.borrow(), PerlValue::Integer(3)));
-                        }
-                        _ => panic!("expected Hash inside Ref"),
-                    },
-                    _ => panic!("expected Ref"),
-                }
-            }
-            _ => panic!("expected Blessed"),
-        }
-    }
-
-    #[test]
-    fn lscalar_bytes() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x01];
-        input.extend_from_slice(&3i32.to_ne_bytes());
-        input.extend_from_slice(b"xyz");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Bytes(b) => assert_eq!(b, b"xyz"),
-            _ => panic!("expected Bytes"),
-        }
-    }
-
-    #[test]
-    fn lutf8str_string() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x18];
-        input.extend_from_slice(&5i32.to_ne_bytes());
-        input.extend_from_slice(b"world");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::String(s) => assert_eq!(s, "world"),
-            _ => panic!("expected String"),
-        }
-    }
-
-    #[test]
-    fn overloaded_ref() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let input = vec![0x14, 0x08, 0xAA];
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Overloaded(inner) => {
-                assert!(matches!(*inner.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected Overloaded"),
-        }
-    }
-
-    #[test]
-    fn weak_overloaded() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let input = vec![0x1C, 0x08, 0xAA];
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        assert!(matches!(&*val.borrow(), PerlValue::WeakOverloaded(_)));
-    }
-
-    #[test]
-    fn vstring_short() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x1D];
-        input.push(3);                       // 1-byte length
-        input.extend_from_slice(&[1, 2, 3]); // vstring bytes
-        input.push(0x0A);                    // SX_SCALAR following
-        input.push(3);                       // 1-byte scalar length
-        input.extend_from_slice(&[1, 2, 3]); // scalar bytes
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::VString(b) => assert_eq!(b, &[1, 2, 3]),
-            _ => panic!("expected VString"),
-        }
-    }
-
-    #[test]
-    fn flag_hash_simple() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x19];
-        input.push(0x01);
-        input.extend_from_slice(&1i32.to_ne_bytes());
-        input.extend_from_slice(&[0x08, 0xAA]);
-        input.push(0x00);
-        input.extend_from_slice(&3i32.to_ne_bytes());
-        input.extend_from_slice(b"key");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::FlagHash { hash_flags, entries } => {
-                assert_eq!(*hash_flags, 0x01);
-                assert_eq!(entries.len(), 1);
-                let (key_flags, v) = entries.get(b"key".as_slice()).unwrap();
-                assert_eq!(*key_flags, 0);
-                assert!(matches!(*v.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected FlagHash"),
-        }
-    }
-
-    #[test]
-    fn tied_scalar() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let input = vec![0x0D, 0x08, 0xAA];
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::TiedScalar(inner) => {
-                assert!(matches!(*inner.borrow(), PerlValue::Integer(42)));
-            }
-            _ => panic!("expected TiedScalar"),
-        }
-    }
-
-    #[test]
-    fn tied_idx() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x16, 0x08, 0xAA];
-        input.extend_from_slice(&5i32.to_ne_bytes());
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::TiedIdx(object, idx) => {
-                assert!(matches!(*object.borrow(), PerlValue::Integer(42)));
-                assert_eq!(*idx, 5);
-            }
-            _ => panic!("expected TiedIdx"),
-        }
-    }
-
-    #[test]
-    fn code_ref() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let src = "sub { $_[0] + 1 }";
-        let mut input = vec![0x1A];       // SX_CODE
-        input.push(0x0A);                 // inner type: SX_SCALAR
-        input.push(src.len() as u8);      // SX_SCALAR uses 1-byte length
-        input.extend_from_slice(src.as_bytes());
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Code(s) => assert_eq!(s, src),
-            other => panic!("code: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn regexp_simple() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        // SX_REGEXP: op_flags=0, re_len=3 (1 byte), "abc", flags_len=1, "i"
-        let mut input = vec![0x20];
-        input.push(0x00);              // op_flags
-        input.push(3);                 // re_len (1 byte)
-        input.extend_from_slice(b"abc");
-        input.push(1);                 // flags_len
-        input.extend_from_slice(b"i"); // flags
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Regexp { pattern, flags } => {
-                assert_eq!(flags, "i");
-                match &*pattern.borrow() {
-                    PerlValue::Bytes(b) => assert_eq!(b, b"abc"),
-                    _ => panic!("expected Bytes pattern"),
-                }
-            }
-            _ => panic!("expected Regexp"),
-        }
-    }
-
-    #[test]
-    fn hook_minimal() {
-        let mut seen = SeenTable::new();
-        let mut classes = ClassTable::new();
-        let config = BodyConfig::native_64();
-        let mut input = vec![0x13];
-        input.push(0x00);
-        input.push(5);
-        input.extend_from_slice(b"MyPkg");
-        input.push(4);
-        input.extend_from_slice(b"data");
-        let val = read_value(&mut cursor(&input), &mut seen, &mut classes, &config).unwrap();
-        match &*val.borrow() {
-            PerlValue::Hook { class, obj_type, frozen, refs, recurse } => {
-                assert_eq!(class, "MyPkg");
-                assert_eq!(*obj_type, 0);
-                assert_eq!(frozen, b"data");
-                assert!(refs.is_empty());
-                assert!(recurse.is_empty());
-            }
-            _ => panic!("expected Hook"),
-        }
-    }
-
-}

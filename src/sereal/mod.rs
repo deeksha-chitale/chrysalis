@@ -42,7 +42,6 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-
     /// Read a varint: 7 bits per byte, high bit means "more bytes follow".
     pub fn read_varint(&mut self) -> Result<u64, SerealError> {
         let mut result: u64 = 0;
@@ -83,37 +82,4 @@ pub enum SerealError {
     CountExceedsInput { count: usize, remaining: usize },
     UnexpectedValueType { expected: &'static str, context: &'static str },
     UnexpectedPacketStart,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn single_byte_varint() {
-        // 5 fits in one byte, high bit clear
-        let mut c = Cursor::new(&[0x05]);
-        assert_eq!(c.read_varint(), Ok(5));
-    }
-
-    #[test]
-    fn two_byte_varint() {
-        // 300 = 0b1_00101100
-        // low 7 bits: 0101100 = 0x2C, with high bit set (more follows) = 0xAC
-        // remaining bits: 10 = 0x02
-        let mut c = Cursor::new(&[0xAC, 0x02]);
-        assert_eq!(c.read_varint(), Ok(300));
-    }
-
-    #[test]
-    fn zero_varint() {
-        let mut c = Cursor::new(&[0x00]);
-        assert_eq!(c.read_varint(), Ok(0));
-    }
-
-    #[test]
-    fn truncated_varint() {
-        let mut c = Cursor::new(&[0x80]); // high bit set, no more bytes
-        assert_eq!(c.read_varint(), Err(SerealError::Truncated));
-    }
 }

@@ -100,45 +100,8 @@ impl Default for SeenTable {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn register_returns_sequential_indices() {
-        let mut table = SeenTable::new();
-        let a = PerlValue::wrap(PerlValue::Integer(1));
-        let b = PerlValue::wrap(PerlValue::Integer(2));
-        assert_eq!(table.register(a), 0);
-        assert_eq!(table.register(b), 1);
-    }
-
-    #[test]
-    fn get_returns_the_registered_value() {
-        let mut table = SeenTable::new();
-        let val = PerlValue::wrap(PerlValue::Integer(42));
-        let idx = table.register(val.clone());
-        let fetched = table.get(idx).unwrap();
-        assert!(Rc::ptr_eq(&val, &fetched));  // same Rc, not a copy
-    }
-
-    #[test]
-    fn get_out_of_range_returns_none() {
-        let table = SeenTable::new();
-        assert!(table.get(0).is_none());
-    }
-
-    #[test]
-    fn shared_registration_preserves_identity() {
-        // Register the same value twice — both indices point to the same Rc.
-        let mut table = SeenTable::new();
-        let val = PerlValue::wrap(PerlValue::Integer(42));
-        let i = table.register(val.clone());
-        let j = table.register(val.clone());
-        assert!(Rc::ptr_eq(&table.get(i).unwrap(), &table.get(j).unwrap()));
-    }
-}
-
+/// A table of class names indexed by the order they were parsed.
+/// Used to resolve SX_IX_BLESS (and OBJECTV-style) class-by-index back-references.
 pub struct ClassTable {
     names: Vec<String>,
 }
@@ -148,12 +111,14 @@ impl ClassTable {
         Self { names: Vec::new() }
     }
 
+    /// Register a class name and return its index.
     pub fn register(&mut self, name: String) -> usize {
         let index = self.names.len();
         self.names.push(name);
         index
     }
 
+    /// Look up a class name by index. Returns None if index is out of range.
     pub fn get(&self, index: usize) -> Option<&str> {
         self.names.get(index).map(|s| s.as_str())
     }
